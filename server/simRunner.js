@@ -7,6 +7,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import os from 'node:os';
+import { runDistributed } from './distribute.js';
 
 const JOBS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'jobs');
 
@@ -165,12 +166,97 @@ export class SimQueue extends EventEmitter {
     this.#broadcastQueue();
   }
 
+  // Shared by the local and distributed paths: both end with a simc-shaped
+  // result.json on disk, so everything downstream is identical.
+  #consumeResult(job, jsonPath) {
+    const json = JSON.parse(readFileSync(jsonPath, 'utf8'));
+    job.result = extractResult(json);
+    if (job.meta?.sets) {
+      job.result.topgear = extractTopGear(json, job.meta.sets, job.result.dps);
+      // what each slot currently wears — the results view shows
+      // "equipped ilvl -> suggested ilvl" and the replaced item's name
+      job.result.equipped = job.meta.gearBySlot ?? null;
+    }
+    this.#finish(job, 'done');
+  }
+
+  #runDistributed(job, jsonPath, inputText, hosts) {
+    // An explicit iteration count is required here for two reasons: the
+    // shared-baseline trick pins iterations onto each profileset, and at
+    // simc's default target_error (~1300 iterations) items within ~0.3% of
+    // each other cannot be ranked reliably by ANY method -- measured at 96%
+    // pair concordance vs 100% at 10000.
+    const iterations = Number(process.env.SIMC_ITERATIONS) || 10000;
+    // Chunks = slots * oversubscribe. More chunks means a shorter ragged tail
+    // when hosts differ in speed (mac-ci is ~5x dell, so a chunk landing on
+    // dell late strands everyone), at the cost of one extra simc startup each.
+    const oversubscribe = Number(process.env.SIMC_OVERSUBSCRIBE) || 3;
+    const handle = runDistributed({
+      inputText,
+      jsonPath,
+      dir: job.dir,
+      hosts,
+      simcPath: this.simcPath,
+      iterations,
+      oversubscribe,
+      onLine: (line) => {
+        job.logTail.push(line);
+        if (job.logTail.length > 40) job.logTail.shift();
+      },
+      onProgress: ({ done, total }) => {
+        job.progress = {
+          phase: 'Chunk',
+          item: `${done}/${total} chunks`,
+          phaseNum: done,
+          phaseTotal: total,
+          iterDone: done,
+          iterTotal: total,
+          percent: Math.round((done / Math.max(1, total)) * 100),
+          meanDps: null,
+          eta: null,
+        };
+        this.emit(`update:${job.id}`, job);
+      },
+      onDone: (err) => {
+        if (job.status !== 'running') return;
+        if (job.cancelRequested) return this.#finish(job, 'cancelled');
+        if (err) {
+          job.error = err.message;
+          return this.#finish(job, 'failed');
+        }
+        try {
+          this.#consumeResult(job, jsonPath);
+        } catch (e) {
+          job.error = `Could not read distributed result: ${e.message}`;
+          this.#finish(job, 'failed');
+        }
+      },
+    });
+    // cancel(id) calls job.proc.kill(); give it the fan-out's killer, which
+    // also sweeps simc processes left running on the remote hosts.
+    job.proc = handle.kill ? { kill: () => handle.kill() } : null;
+    if (handle.error) {
+      job.error = handle.error;
+      this.#finish(job, 'failed');
+    }
+  }
+
   #run(job) {
     job.status = 'running';
     job.startedAt = Date.now();
     this.emit(`update:${job.id}`, job);
 
     const jsonPath = join(job.dir, 'result.json');
+
+    // SIMC_HOSTS switches profileset work (droptimizer / top gear) onto a
+    // GNU parallel fan-out across machines. Sims with no profilesets -- a
+    // plain quick sim -- have nothing to split, so they take the local path.
+    const hosts = process.env.SIMC_HOSTS?.trim();
+    const inputText = readFileSync(join(job.dir, 'input.simc'), 'utf8');
+    if (hosts && /^profileset\./m.test(inputText)) {
+      return this.#runDistributed(job, jsonPath, inputText, hosts);
+    }
+
     const threads = Math.max(1, os.cpus().length - 1);
     const args = [
       join(job.dir, 'input.simc'),
@@ -228,15 +314,7 @@ export class SimQueue extends EventEmitter {
         this.#finish(job, 'cancelled');
       } else if (code === 0 && existsSync(jsonPath)) {
         try {
-          const json = JSON.parse(readFileSync(jsonPath, 'utf8'));
-          job.result = extractResult(json);
-          if (job.meta?.sets) {
-            job.result.topgear = extractTopGear(json, job.meta.sets, job.result.dps);
-            // what each slot currently wears — the results view shows
-            // "equipped ilvl -> suggested ilvl" and the replaced item's name
-            job.result.equipped = job.meta.gearBySlot ?? null;
-          }
-          this.#finish(job, 'done');
+          this.#consumeResult(job, jsonPath);
         } catch (e) {
           job.error = `Could not parse simc JSON output: ${e.message}`;
           this.#finish(job, 'failed');
