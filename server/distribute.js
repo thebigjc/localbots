@@ -263,7 +263,7 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
     let todo = files.slice();
     for (let round = 0; round <= maxHeals && todo.length && !cancelled; round++) {
       const r = await runRound(todo);
-      if (cancelled) break;
+      if (cancelled) break;   // falls through to the notify below
       if (r.error) { clearInterval(timer); return onDone(r.error); }
 
       const failed = todo.filter((f) => !existsSync(`${f}.json`));
@@ -286,7 +286,10 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
       todo = next;
     }
     clearInterval(timer);
-    if (cancelled) return;
+    // The caller has to be told, or the job sits in 'running' forever and the
+    // cancel button looks dead. The local path gets this free from
+    // proc.on('close') firing after SIGKILL; a fan-out has no such event.
+    if (cancelled) return onDone(new Error('cancelled'));
 
     try {
       const ok = files.filter((f) => existsSync(`${f}.json`));
