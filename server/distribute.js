@@ -17,9 +17,27 @@
 
 import { spawn } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 
 const PROFILESET_RE = /^profileset\."([^"]+)"\s*\+?=/;
+
+// simc's own progress line, as it appears once --tag has prefixed the chunk:
+//   chunk-003.simc\tGenerating Profileset: feet+2 3/8 [==>...] 4200/10000 267.4 1sec
+// Also matches the baseline phase, which has no item name.
+const TAGGED_RE = /^(\S+)\t(?:Generating (Profileset|Baseline)?:?\s*)?(.*?)\s*(\d+)\/(\d+)\s*\[[^\]]*\]\s*(\d+)\/(\d+)\s*([\d.]+)?/;
+
+function parseTagged(line) {
+  const m = line.match(TAGGED_RE);
+  if (!m) return null;
+  const [, chunk, phase, item, phaseNum, phaseTotal, iterDone, iterTotal, mean] = m;
+  // simc emits "Generating Baseline:" with no name, so keep the phase word --
+  // without it a baseline row has nothing to show but its chunk filename.
+  return { chunk, phase: phase || 'Profileset',
+           item: (item || '').replace(/^Profileset:?\s*/, '').trim() || null,
+           phaseNum: +phaseNum, phaseTotal: +phaseTotal,
+           iterDone: +iterDone, iterTotal: +iterTotal,
+           meanDps: mean ? +mean : null };
+}
 
 // Split input into the shared base profile and per-profileset line groups.
 // A profileset spans multiple lines ("name"= then "name"+=), so lines are
@@ -172,6 +190,10 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
     writeFileSync(f, text);
     return f;
   });
+  // exact profileset count per chunk, so overall progress is counted rather
+  // than extrapolated from whichever workers happen to be reporting
+  const chunkSets = new Map(files.map((f, i) => [basename(f), chunkProfilesetNames(chunks[i]).length]));
+  const setsTotal = [...chunkSets.values()].reduce((a, b) => a + b, 0);
 
   const remote = hosts.split(',')
     .map((h) => h.trim().replace(/^\d+\//, ''))
@@ -183,15 +205,21 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
   const dropped = [];
   const total = files.length;
   const doneCount = () => files.filter((f) => existsSync(`${f}.json`)).length;
+  // live state per chunk, keyed by basename, so the UI can show what each
+  // worker is actually doing rather than just how many chunks have landed
+  const live = new Map();
 
   const runRound = (todo) => new Promise((resolve) => {
-    const args = ['--sshlogin', hosts, '--line-buffer', '--joblog', join(chunkDir, `joblog-${todo.length}-${Date.now()}`)];
+    const args = ['--sshlogin', hosts, '--line-buffer', '--tag', '--tagstring', '{/}',
+                  '--joblog', join(chunkDir, `joblog-${todo.length}-${Date.now()}`)];
     if (remote) args.push('--transferfile', '{}', '--return', '{}.json', '--return', '{}.log', '--cleanup', '--workdir', '...');
-    // Per-chunk log so a failure can be diagnosed and healed; the command runs
-    // through a shell, so the redirect works locally and remotely alike.
+    // tee, not redirect: the log is needed to diagnose and heal a failed chunk,
+    // but sending stdout there too leaves parallel's stream empty and the UI
+    // with nothing to report but "N of M chunks". --tag prefixes every line
+    // with its chunk file so progress can be attributed to a worker.
     let cmd = `${bin} {} json2={}.json threads=1 report_details=1 seed=${seed}`;
     if (iterations && !pinned) cmd += ` iterations=${iterations}`;
-    cmd += ` > {}.log 2>&1`;
+    cmd += ` 2>&1 | tee {}.log`;
     args.push(cmd, ':::', ...todo);
 
     const proc = spawn('parallel', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -200,7 +228,12 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
     const onData = (d) => {
       buf += d.toString();
       const parts = buf.split(/[\r\n]/); buf = parts.pop();
-      for (const l of parts) if (l.trim()) onLine(l);
+      for (const l of parts) {
+        if (!l.trim()) continue;
+        const p = parseTagged(l);
+        if (p) live.set(p.chunk, { ...p, at: Date.now() });
+        else onLine(l);
+      }
     };
     proc.stdout.on('data', onData);
     proc.stderr.on('data', onData);
@@ -208,7 +241,23 @@ export function runDistributed({ inputText, jsonPath, dir, hosts, simcPath, seed
     proc.on('close', () => resolve({}));
   });
 
-  const timer = setInterval(() => onProgress({ done: doneCount(), total }), 1000);
+  const timer = setInterval(() => {
+    const done = doneCount();
+    // A finished chunk keeps reporting its last line forever, which would both
+    // inflate the worker count past the slot count and double-count its
+    // profilesets. Drop anything whose result has landed.
+    let finishedSets = 0;
+    for (const f of files) {
+      const b = basename(f);
+      if (existsSync(`${f}.json`)) { live.delete(b); finishedSets += chunkSets.get(b) ?? 0; }
+    }
+    const workers = [...live.values()].sort((a, b) => a.chunk.localeCompare(b.chunk));
+    // Completed chunks contribute their whole size; a running chunk contributes
+    // the profilesets it has finished, phaseNum being 1-based on the current one.
+    const setsDone = Math.min(setsTotal,
+      finishedSets + workers.reduce((n, w) => n + Math.max(0, w.phaseNum - 1), 0));
+    onProgress({ done, total, workers, setsDone, setsTotal });
+  }, 1000);
 
   (async () => {
     let todo = files.slice();

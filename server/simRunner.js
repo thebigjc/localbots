@@ -203,17 +203,36 @@ export class SimQueue extends EventEmitter {
         job.logTail.push(line);
         if (job.logTail.length > 40) job.logTail.shift();
       },
-      onProgress: ({ done, total }) => {
+      onProgress: ({ done, total, workers, setsDone, setsTotal }) => {
+        // Prefer profilesets when we can see them: chunks move in big steps
+        // (1 of 42) whereas profilesets tick continuously, which is what the
+        // local path shows and what makes a distributed run feel alive.
+        const useSets = setsTotal && setsTotal > total;
+        const num = useSets ? setsDone : done;
+        const den = useSets ? setsTotal : total;
         job.progress = {
-          phase: 'Chunk',
-          item: `${done}/${total} chunks`,
-          phaseNum: done,
-          phaseTotal: total,
-          iterDone: done,
-          iterTotal: total,
-          percent: Math.round((done / Math.max(1, total)) * 100),
+          phase: useSets ? 'Profileset' : 'Chunk',
+          item: workers.length
+            ? `${workers.length} worker${workers.length === 1 ? '' : 's'} · ${done}/${total} chunks done`
+            : `${done}/${total} chunks`,
+          phaseNum: num,
+          phaseTotal: den,
+          iterDone: num,
+          iterTotal: den,
+          percent: Math.min(100, Math.round((num / Math.max(1, den)) * 100)),
           meanDps: null,
           eta: null,
+          // one entry per busy worker, so the UI can draw a bar each
+          workers: workers.map((w) => ({
+            chunk: w.chunk,
+            phase: w.phase,
+            item: w.item,
+            phaseNum: w.phaseNum,
+            phaseTotal: w.phaseTotal,
+            percent: Math.min(100, Math.round(((w.phaseNum - 1 + w.iterDone / Math.max(1, w.iterTotal))
+                                               / Math.max(1, w.phaseTotal)) * 100)),
+            meanDps: w.meanDps,
+          })),
         };
         this.emit(`update:${job.id}`, job);
       },

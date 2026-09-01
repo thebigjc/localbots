@@ -1292,12 +1292,18 @@ function handleUpdate(u) {
       const phase = p.item
         ? `Item ${p.phaseNum - 1}/${p.phaseTotal - 1}: ${p.item.replace(/ @[a-z_0-9]+$/, '').replace(/ \[[a-z]?\d+\]$/, '')}`
         : p.phaseTotal > 1 ? `${p.phase} ${p.phaseNum}/${p.phaseTotal}` : p.phase;
+      // A distributed run counts profilesets, not iterations -- saying
+      // "4,200 / 10,000 iterations" would be one worker's slice, not the job.
+      const distributed = Array.isArray(p.workers);
       const detail = [
-        `${p.iterDone.toLocaleString()} / ${p.iterTotal.toLocaleString()} iterations`,
+        distributed
+          ? `${p.phaseNum.toLocaleString()} / ${p.phaseTotal.toLocaleString()} profilesets`
+          : `${p.iterDone.toLocaleString()} / ${p.iterTotal.toLocaleString()} iterations`,
         p.meanDps ? `~${Math.round(p.meanDps).toLocaleString()} DPS` : null,
         p.eta ? `ETA ${p.eta}` : null,
       ].filter(Boolean).join(' · ');
-      setProgress(phase, p.percent, detail);
+      setProgress(distributed ? p.item : phase, p.percent, detail);
+      renderWorkers(p.workers);
     } else {
       setProgress('Initializing simc…', 2, '');
     }
@@ -1384,6 +1390,32 @@ function setProgress(phase, percent, detail) {
   $('progress-phase').textContent = phase;
   $('progress-bar').style.width = `${percent}%`;
   $('progress-detail').textContent = detail;
+}
+
+// One bar per busy worker on a distributed run. Chunks are handed out as
+// workers free up, so which chunk a bar shows changes through the run -- the
+// point is to see that every machine is busy and roughly how far along.
+function renderWorkers(workers) {
+  const el = $('progress-workers');
+  if (!el) return;
+  if (!workers?.length) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.classList.remove('hidden');
+  el.innerHTML = workers.map((w) => {
+    // A baseline row has no item name; showing "chunk-000.simc" tells the
+    // reader nothing, whereas "Baseline" says exactly what is happening.
+    const label = w.item
+      ? w.item.replace(/ @[a-z_0-9]+$/, '')
+      : (w.phase === 'Baseline' ? 'Baseline' : w.chunk.replace(/\.simc$/, ''));
+    return `
+      <div class="worker">
+        <div class="worker-top">
+          <span class="worker-name">${esc(label)}</span>
+          <span class="worker-sub">${w.phaseNum}/${w.phaseTotal}${
+            w.meanDps ? ` · ~${Math.round(w.meanDps).toLocaleString()}` : ''}</span>
+        </div>
+        <div class="worker-track"><div class="worker-fill" style="width:${w.percent}%"></div></div>
+      </div>`;
+  }).join('');
 }
 
 function renderResult(r) {

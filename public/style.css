@@ -959,3 +959,12 @@ span.char-item.missing,
 .item-tip .tip-set { margin-top: 7px; border-top: 1px solid var(--border); padding-top: 6px; }
 .item-tip .tip-setname { color: var(--accent); font-weight: 600; }
 .item-tip .tip-setb { color: #4ade80; margin-top: 4px; }
+
+/* --- distributed run: one bar per worker -------------------------------- */
+.progress-workers { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.worker { display: flex; flex-direction: column; gap: 3px; }
+.worker-top { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; opacity: .8; }
+.worker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.worker-sub { font-variant-numeric: tabular-nums; opacity: .8; flex: none; }
+.worker-track { height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.worker-fill { height: 100%; background: var(--accent, #7aa2f7); transition: width .3s ease; }
