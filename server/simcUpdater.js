@@ -2,6 +2,13 @@
 // (macOS/Linux: git checkout + ninja build, binary symlinked onto PATH).
 // Windows nightly binaries can't be rebuilt — detectSimcSource returns null
 // there and the UI keeps showing manual instructions instead.
+//
+// SIMC_REBUILD_CMD escape hatch: when set, it replaces the built-in
+// git-pull-then-ninja entirely. Needed whenever the toolchain is not plainly
+// on PATH or the build needs post-processing — a Nix/Guix shell, a container,
+// a cross-compile, or a PGO/LTO recipe that has to relink and patch the
+// binary afterwards. The command is run with cwd=<simc source dir>; any
+// non-zero exit is surfaced in the UI exactly like a ninja failure.
 
 import { spawn } from 'node:child_process';
 import { realpathSync, existsSync } from 'node:fs';
@@ -53,13 +60,22 @@ export function startSimcUpdate(source, state, onDone) {
     });
   });
 
+  const custom = process.env.SIMC_REBUILD_CMD?.trim();
+
   (async () => {
-    await run('git', ['pull', '--ff-only'], source.srcDir);
-    state.step = 'building simc (a minute or two)';
-    await run('ninja', ['simc'], source.buildDir, (line) => {
+    const onNinjaLine = (line) => {
       const m = line.match(/^\[(\d+)\/(\d+)\]/);
       if (m) state.progress = { done: Number(m[1]), total: Number(m[2]) };
-    });
+    };
+    if (custom) {
+      // The custom command owns the whole update, pull included.
+      state.step = 'rebuilding simc (custom recipe)';
+      await run('sh', ['-c', custom], source.srcDir, onNinjaLine);
+      return;
+    }
+    await run('git', ['pull', '--ff-only'], source.srcDir);
+    state.step = 'building simc (a minute or two)';
+    await run('ninja', ['simc'], source.buildDir, onNinjaLine);
   })()
     .then(() => onDone(null))
     .catch((err) => { state.error = err.message; onDone(err); })
