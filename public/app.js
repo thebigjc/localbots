@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 
 let currentJobId = null;
 let eventSource = null;
+let streamDegraded = false;   // stream dropped and EventSource is retrying
 let mode = 'quick';
 let gearItems = []; // last parsed bag/vault items, indexes match checkboxes
 let itemSets = []; // detected item sets from /api/gear
@@ -1271,14 +1272,57 @@ async function startSim() {
   showQueue(null);
   setProgress('Starting…', 0, '');
 
+  streamDegraded = false;
   eventSource = new EventSource(`/api/sim/${currentJobId}/events`);
-  eventSource.onmessage = (ev) => handleUpdate(JSON.parse(ev.data));
-  eventSource.onerror = () => {
-    // stream closes normally at job end; only report if we never finished
-    if (currentJobId) {
-      showError('Lost connection to the sim progress stream.');
-      resetControls();
+  // A throw in here would stop every later event being processed -- including
+  // the terminal one -- so a finished job would look like a dropped connection.
+  // Never let a render error eat the stream.
+  eventSource.onmessage = (ev) => {
+    let u;
+    try {
+      u = JSON.parse(ev.data);
+    } catch (e) {
+      console.error('sim stream: unparseable event', e, ev.data?.slice?.(0, 200));
+      return;
     }
+    // A message means the stream is alive. If it had dropped -- backgrounding
+    // the browser on a phone is enough -- clear the warning rather than leaving
+    // a stale "lost connection" sitting over a run that recovered.
+    if (streamDegraded) {
+      streamDegraded = false;
+      hideError();
+      $('cancel-button').classList.remove('hidden');
+      $('sim-button').disabled = true;
+    }
+    try {
+      handleUpdate(u);
+    } catch (e) {
+      console.error('sim stream: handleUpdate failed', e, u);
+      // The job is fine; only the display broke. Close out cleanly on a
+      // terminal event so it does not masquerade as a lost connection.
+      if (u.status === 'done' || u.status === 'failed' || u.status === 'cancelled') {
+        finishStream();
+        showError(`The sim finished but the results could not be displayed: ${e.message}`);
+      }
+    }
+  };
+  eventSource.onerror = () => {
+    // Fires on any close, including the clean one at job end -- finishStream
+    // clears currentJobId, so a set id means the job was still going.
+    if (!currentJobId) return;
+    // ...but it also fires on a transient drop, and EventSource retries by
+    // itself. Backgrounding a browser on a phone suspends the connection and
+    // triggers exactly this. Resetting the controls there would re-enable the
+    // Sim button mid-run, and the warning would never clear once it recovered.
+    if (eventSource?.readyState === EventSource.CONNECTING) {
+      streamDegraded = true;
+      showError('Reconnecting to the sim… (the sim keeps running on the server)');
+      return;   // controls stay as they are; a message will clear this
+    }
+    console.warn('sim stream: closed for good while job', currentJobId, 'was running');
+    showError('Lost connection to the sim progress stream. The sim may still be '
+            + 'running — check History in a moment.');
+    resetControls();
   };
 }
 
