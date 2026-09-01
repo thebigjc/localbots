@@ -223,16 +223,25 @@ export class SimQueue extends EventEmitter {
           meanDps: null,
           eta: null,
           // one entry per busy worker, so the UI can draw a bar each
-          workers: workers.map((w) => ({
-            chunk: w.chunk,
-            phase: w.phase,
-            item: w.item,
-            phaseNum: w.phaseNum,
-            phaseTotal: w.phaseTotal,
-            percent: Math.min(100, Math.round(((w.phaseNum - 1 + w.iterDone / Math.max(1, w.iterTotal))
-                                               / Math.max(1, w.phaseTotal)) * 100)),
-            meanDps: w.meanDps,
-          })),
+          // simc counts the baseline as phase 1, so a chunk holding a single
+          // profileset reports 2/2. Every chunk has a baseline -- a real one in
+          // the first chunk, a one-iteration throwaway in the rest -- and none
+          // of them are work the user asked for, so report profilesets only.
+          // The local path does the same (phaseNum - 1 / phaseTotal - 1).
+          workers: workers.map((w) => {
+            const setsTotalHere = Math.max(1, w.phaseTotal - 1);
+            const setsDoneHere = Math.max(0, w.phaseNum - 2);   // -1 baseline, -1 for the in-flight one
+            const frac = w.phaseNum > 1 ? w.iterDone / Math.max(1, w.iterTotal) : 0;
+            return {
+              chunk: w.chunk,
+              phase: w.phase,
+              item: w.item,
+              phaseNum: Math.max(0, w.phaseNum - 1),
+              phaseTotal: setsTotalHere,
+              percent: Math.min(100, Math.round(((setsDoneHere + frac) / setsTotalHere) * 100)),
+              meanDps: w.meanDps,
+            };
+          }),
         };
         this.emit(`update:${job.id}`, job);
       },
